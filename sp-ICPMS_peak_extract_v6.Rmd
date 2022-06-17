@@ -1,0 +1,268 @@
+---
+title: "Analyze raw data of sp-ICP-MS and produce size distribution"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r}
+
+library(rmarkdown)
+library(svDialogs) 
+library(data.table)
+library(openxlsx)
+library(ggplot2)
+library(dtw)
+library(dtwclust)
+#library(grid) # for unit
+#library(gridExtra) # for grid.arrange
+#library(reshape2)
+#library(cluster)
+#library(dendextend)
+#library(factoextra)
+#library(NbClust)
+#library(sp)
+#library(dplyr)
+#library(datasets)
+#library(fBasics)
+
+```
+
+
+```{r}
+## 1. Load raw data files (load all csv file in a data folder)
+
+DataFolder <- choose.dir(default = "", caption = "Select folder")
+
+DataFiles <- list.files(path = DataFolder, pattern = ".csv", all.files = FALSE, 
+                        full.names = TRUE, recursive = TRUE, ignore.case = FALSE, 
+                        include.dirs = FALSE, no.. = FALSE)
+rawdata <- data.frame()
+for (i in 1:length(DataFiles)){
+rawdatai <- read.csv(DataFiles[i], header=TRUE)
+rawdata <- rbind(rawdata, rawdatai)
+rawdatai <- data.frame()
+}
+
+
+# Input values for Slope and Intercept of dissolved ions calibration curve
+
+FlowRate <- dlgInput("Flow rate (mL/min) = ", Sys.info()["user"])$res; FlowRate <- as.numeric(FlowRate)
+TE <- dlgInput("Transport Efficiency (%) = ", Sys.info()["user"])$res; TE <- as.numeric(TE)
+DwellTime <- dlgInput("Dwell time (us) = ", Sys.info()["user"])$res; DwellTime <- as.numeric(DwellTime)
+ScanTime <- dlgInput("Scan time (s) = ", Sys.info()["user"])$res; ScanTime <- as.numeric(ScanTime)
+Slope <- dlgInput("Slope of calibration curve? :", Sys.info()["user"])$res; Slope <- as.numeric(Slope)
+Intercept <- dlgInput("Intercept of calibration curve? :", Sys.info()["user"])$res; Intercept <- as.numeric(Intercept)
+
+
+
+
+##  2. Extract Peaks table 
+
+##  2.1. Assign peak number (peak group) to raw data
+
+colnames(rawdata) <- c("Signal", "Peak.no") # name 2 columns
+rawdata$Signal <- round(rawdata$Signal,1) # round signal to interger
+
+
+# build a function named "PeakAssign" to assign peak number for spICPMS Signal, the function will collect all Signal greater than t
+PeakAssign <- function(x,t){
+  ifelse(y <- x>t, cumsum(c(head(y, 1), tail(y, -1) - head(y, -1) == 1)), NA)  
+}
+
+# Apply function PeakAssign to spICPMS data
+T=0; rawdata$Signal <- (rawdata$Signal - T) # T is background, can be determined using 3sigma rule or other methods
+rawdata$Peak.no <- PeakAssign(rawdata$Signal,T)
+data <- subset(rawdata, Peak.no>0)
+
+
+## 2.2. Collect Peak Width, Peak height, Peak Area, Mass, Diameter
+
+Peak.Width <- aggregate(data$Peak.no, by=list(Peak.no=data$Peak.no), FUN=function(x){NROW(x)}); # Count how many dwell time in one peak. "FUN=function(x){NROW(x)}" is same for every data
+colnames(Peak.Width) <- c("Peak.no", "Width") # name 2 columns of Peak.Width
+PW <- Peak.Width[rep(row.names(Peak.Width), Peak.Width$Width), 1:2] # make row number of Peak.Width equal to row number of raw data and sign it as PL
+data$Dwell.time.i <- ave(data[,1], data$Peak.no, FUN = seq_along) # numbering each dwel time in one peak
+data$Peak.Width <- PW[,2] # add Peak.Width column to raw data
+
+  #Count how many dwell time in one peak. "FUN=function(x){NROW(x)}" is same for every data
+DT <- aggregate(data$Peak.no, by=list(Peak.no=data$Peak.no), FUN=function(x){NROW(x)})
+colnames(DT) <- c("Peak.no", "Peak.Width")
+DT$Event.Duration.us <- DT$Peak.Width * DwellTime
+
+  # Calculate Peak Area (PA) for each peak group
+PA <- aggregate(data$Signal, by=list(Peak.no=data$Peak.no), FUN=sum)
+PA <- subset(PA, select=-Peak.no) #remove column "Peak.no" because DT (above) already has this column
+colnames(PA) <- c("Peak.Area")
+PA$Mass.ag <- round((PA$Peak.Area - Intercept)/Slope*10^12, digits = 0)
+PA$Diameter.nm <- round((6*PA$Mass.ag/10^18/3.14/19.3)^(1/3)*10^7, digits = 1)
+
+  # Extract peak height (PH) which is max of one peak group  
+PH <- aggregate(data$Signal, by=list(Peak.no=data$Peak.no), FUN=max)
+PH <- subset(PH, select=-Peak.no) #remove column "Peak.no" because DT (above) already has this column
+colnames(PH) <- c("Peak.Max")
+
+    # Combine columns Peak.no, Number of dwell time in one peak, Peak Area into 1 table called Table.1
+Table.1 <- cbind(DT, PH, PA)
+#=====================================================================================================================
+
+
+
+## 2.3. Collect peak content. Each Peak has a certain length which is number of dwell times. In each dwell time, there is signal corresponding to that dwell time denoted as DT0, DT1, DT2...  This step will collect those signals.
+#=====================================================================================================================
+# Collect every peak to "PeakList", each Peak is a vector, PeakList is a list of (Peak) vectors
+PeakList <- lapply(Table.1$Peak.no, function(i){
+  dat <- subset(data$Signal, data$Peak.no==i)
+})
+
+# Connvert each Peak (vector) to data frame
+PeakList <- lapply(PeakList, as.data.frame.list)
+
+# Put column names for each Peak with the form: DT1, DT2, ..., DTn
+PeakList <- lapply(PeakList, function(i){
+  names(i) <- paste("DT",1:length(i),sep="")
+  return(i)
+})
+
+# Combine all Peaks, row by row (i.e. Peak 1 is row 1, Peak 2 is row 2...) to make data table "Table.2"
+Table.2 <- rbindlist(PeakList, fill = TRUE)
+Table.2[is.na(Table.2)] <- 0
+Table.2$DT.. <- 0
+# Combine "Table.1" (Peak.No, Peak.Area, Mass, Diameter) and "Table.2" (Peak conntent) to make "Table.3"
+Table.1$DT. <- 0
+Table.3 <- cbind(Table.1,Table.2)
+name1 <- paste(DataFolder,'PeakTable.xlsx', sep="/")
+write.xlsx(Table.3, file = name1, asTable = FALSE)
+#=====================================================================================================================
+
+
+# After getting Peak Table, we will draw plots of data
+
+# Open Excel file (xlsx format) that was saved by using line 128
+# Table.3 is the PeakTable we can dirrectly use Table.3
+
+#PeakTableFile <- file.choose()
+#Table.4 <- read.xlsx(PeakTableFile, sheet = 1, startRow = 1, colNames = TRUE,
+#  rowNames = FALSE, detectDates = FALSE, skipEmptyRows = TRUE,
+#  skipEmptyCols = TRUE, rows = NULL, cols = NULL, check.names = FALSE,
+#  namedRegion = NULL, na.strings = "NA", fillMergedCells = FALSE)
+#Table.6 <- Table.4[,8:ncol(Table.4)]
+
+
+## Extract PeakWidth frequency and Peak Area frequency to find cut off values to remove noise
+#=====================================================================================================================
+# Create PeakWidthTable containing PeakWidth and Frequency of PeakWidth
+PeakWidthList <- lapply(c(1:max(Table.3$Peak.Width)), function(i){
+  dat <- nrow(subset(Table.3, Table.3$Peak.Width==i))
+})
+PeakWidthTable <- data.frame(
+  Peak.Width = c(1:max(Table.3$Peak.Width)),
+  Frequency = unlist(PeakWidthList),
+  Percentage = unlist(PeakWidthList)/nrow(Table.3)*100
+)
+
+PeakAreaList <- lapply(c(1:max(Table.3$Peak.Area)), function(i){
+  dat <- nrow(subset(Table.3, Table.3$Peak.Area==i))
+})
+PeakAreaTable <- data.frame(
+  Peak.Area = c(1:max(Table.3$Peak.Area)),
+  Frequency = unlist(PeakAreaList),
+  Percentage = unlist(PeakAreaList)/nrow(Table.3)*100
+)
+
+
+
+# Build functions to find local maxima and local minima
+maximums <- function(x) which(x - shift(x, 1) > 0  & x - shift(x, 1, type='lead') > 0)
+minimums <- function(x) which(x - shift(x, 1) < 0  & x - shift(x, 1, type='lead') < 0)
+
+# Find the 1st local minimum of PeakWidthTable$Frequency and PeakAreaTable$Frequency
+LocalMinPeakWidth <- minimums(PeakWidthTable$Frequency)
+LocalMinPeakArea <- minimums(PeakAreaTable$Frequency)
+
+# Peak Width cut off = The 1st local minimum of PeakWidthTable$Frequency and Peak Area cut off = The 1st local minimum of PeakAreaTable$Frequency
+PW_cutoff = LocalMinPeakWidth[1]
+PA_cutoff = LocalMinPeakArea[1]
+
+Table.4 <- subset(Table.3, (Table.3$Peak.Width>PW_cutoff) & (Table.3$Peak.Area > PA_cutoff) )
+Table.5 <- data.frame(
+  Data = DataFolder,
+  Flow.Rate.mL.per.min = FlowRate,
+  Transport.Efficiency.percentage = TE,
+  Dwell.time.us = DwellTime,
+  Scan.Time.s = ScanTime,
+  Mean.Mass.ag = mean(Table.4$Mass.ag),
+  Mean.Intensity.counts = mean(Table.4$Peak.Area),
+  Mean.Diameter.nm = mean(Table.4$Diameter.nm),
+  Number.Particles = nrow(Table.4),
+  Particles.per.mL = nrow(Table.4)/ScanTime*60/FlowRate*100/TE,
+  Cut.off.Event.Duration = PW_cutoff * DwellTime,
+  Cut.off.Peak.Area = PA_cutoff
+)
+
+
+# Save Table.4 and Table.5 to excel
+ExcelFile <- createWorkbook("SPICPMS")
+addWorksheet(ExcelFile, "Sheet1")
+addWorksheet(ExcelFile, "Sheet2")
+writeData(ExcelFile, sheet = 1, Table.4)
+writeData(ExcelFile, sheet = 2, Table.5)
+name2 <- paste(DataFolder,'PeakTable_Filtered.xlsx', sep="/")
+saveWorkbook(ExcelFile, name2, overwrite = TRUE)
+
+```
+
+```{r}
+# Hierachichal clustering for Peak Area
+
+
+PeakTableFile <- file.choose()
+Table.4 <- read.xlsx(PeakTableFile, sheet = 1, startRow = 1, colNames = TRUE,
+  rowNames = FALSE, detectDates = FALSE, skipEmptyRows = TRUE,
+  skipEmptyCols = TRUE, rows = NULL, cols = NULL, check.names = FALSE,
+  namedRegion = NULL, na.strings = "NA", fillMergedCells = FALSE)
+
+PeakArea <- Table.4$Peak.Area; PeakArea <- as.data.frame(PeakArea)
+
+dist_mat <- dist(PeakArea, method = 'euclidean')
+hclust_avg <- hclust(dist_mat, method = 'average')
+plot(hclust_avg)
+rect.hclust(hclust_avg , k = 5, border = 1:5)
+abline(h = 5, col = 'red')
+
+```
+
+
+```{r}
+# Peak Shape analysis by Dynamic Time Wrapping
+PeakTableFile <- file.choose()
+Table.4 <- read.xlsx(PeakTableFile, sheet = 1, startRow = 1, colNames = TRUE,
+  rowNames = FALSE, detectDates = FALSE, skipEmptyRows = TRUE,
+  skipEmptyCols = TRUE, rows = NULL, cols = NULL, check.names = FALSE,
+  namedRegion = NULL, na.strings = "NA", fillMergedCells = FALSE)
+Table.6 <- Table.4[,8:ncol(Table.4)]
+
+
+peaksclusters <- tsclust(Table.6, type = "hierarchical", k = 10L,
+                  preproc = zscore, seed = 899,
+                  distance = "sbd", centroid = shape_extraction,
+                  control = hierarchical_control(method = "average", 
+                                                 symmetric = FALSE, 
+                                                 packages = character(0L)))
+
+ 
+tiff(paste(dirname(PeakTableFile), '/10_Clusters.tiff', sep = '') , compression = "lzw", units = 'cm',res = 900, height = 18, width = 32)
+  plot(peaksclusters, type = "sc")
+  dev.off()
+  
+Table.4$DTW_Cluster <- cutree(peaksclusters, k=10)
+
+ExcelFile <- createWorkbook("SPICPMS")
+addWorksheet(ExcelFile, "Sheet1")
+
+writeData(ExcelFile, sheet = 1, Table.4)
+
+name2 <- paste(dirname(PeakTableFile),'DTW.xlsx', sep="/")
+saveWorkbook(ExcelFile, name2, overwrite = TRUE)
+
+
+```
